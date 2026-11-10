@@ -413,3 +413,12 @@ app.listen(port, '0.0.0.0', () => {
     .then(() => console.log('Quran text cached'))
     .catch((error) => console.error('Quran prefetch failed', error));
 });
+
+// Keep the free Render instance (and the ASR Space) awake by pinging through the public URLs.
+const keepAwakeUrls = [process.env.RENDER_EXTERNAL_URL ? `${process.env.RENDER_EXTERNAL_URL}/health` : '', process.env.SELFHOST_ASR_URL || '']
+  .filter(Boolean);
+if (keepAwakeUrls.length) {
+  setInterval(() => {
+    for (const url of keepAwakeUrls) fetch(url).catch(() => {});
+  }, 10 * 60 * 1000);
+}
