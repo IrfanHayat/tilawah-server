@@ -8,6 +8,7 @@ import { hashPassword, optionalUser, requireUser, signToken, verifyGoogleIdToken
 import { connectDb, dbReady, requireDb } from './db';
 import { compareRecitation } from './arabic';
 import { Bookmark, Goal, Mistake, PracticeSession, TestRun, User } from './models';
+import { warmLocalAsr } from './transcribe';
 import { ensureQuran, quranReady, rangeText, searchTranscript } from './quran';
 import { computeStats } from './stats';
 import { AsrNotConfiguredError, asrStatus, transcribe } from './transcribe';
@@ -404,6 +405,7 @@ app.use((error: Error & { status?: number }, _req: express.Request, res: express
 });
 
 const port = Number(process.env.PORT) || 8787;
+warmLocalAsr();
 app.listen(port, '0.0.0.0', () => {
   console.log(`Tilawah API listening on 0.0.0.0:${port}`);
   connectDb()

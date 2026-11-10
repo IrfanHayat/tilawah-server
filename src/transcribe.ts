@@ -4,13 +4,14 @@ import { unlink, writeFile, readFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
-export type AsrProvider = 'huggingface' | 'selfhost' | 'openai' | 'none';
+export type AsrProvider = 'local' | 'huggingface' | 'selfhost' | 'openai' | 'none';
 
 const DEFAULT_MODEL = 'tarteel-ai/whisper-base-ar-quran';
 
 export function asrStatus() {
   return {
     provider: chosenProvider(),
+    local: chosenProvider() === 'local' ? (localReady ? 'ready' : 'loading') : 'off',
     model: process.env.HF_MODEL || DEFAULT_MODEL,
     huggingface: Boolean(process.env.HF_TOKEN),
     selfhost: Boolean(process.env.SELFHOST_ASR_URL),
@@ -20,6 +21,7 @@ export function asrStatus() {
 
 export function chosenProvider(): AsrProvider {
   const explicit = (process.env.TRANSCRIPTION_PROVIDER || 'auto').toLowerCase();
+  if (explicit === 'local') return 'local';
   if (explicit === 'huggingface') return process.env.HF_TOKEN ? 'huggingface' : 'none';
   if (explicit === 'selfhost') return process.env.SELFHOST_ASR_URL ? 'selfhost' : 'none';
   if (explicit === 'openai') return process.env.OPENAI_API_KEY ? 'openai' : 'none';
@@ -104,6 +106,63 @@ async function huggingface(audio: Buffer, mime: string) {
   throw new Error(last);
 }
 
+const LOCAL_MODEL = process.env.LOCAL_ASR_MODEL || 'Mustanad/whisper-base-ar-quran-onnx';
+let localReady = false;
+let localPipe: Promise<any> | null = null;
+
+function loadLocal() {
+  if (!localPipe) {
+    localPipe = (async () => {
+      const t: any = await import('@huggingface/transformers');
+      t.env.cacheDir = process.env.MODEL_CACHE_DIR || '/tmp/hf-models';
+      const pipe = await t.pipeline('automatic-speech-recognition', LOCAL_MODEL, {
+        dtype: { encoder_model: 'q8', decoder_model_merged: 'q8' },
+        subfolder: 'onnx',
+        session_options: { intraOpNumThreads: 1, interOpNumThreads: 1, enableCpuMemArena: false, enableMemPattern: false },
+      });
+      localReady = true;
+      return pipe;
+    })().catch((error) => {
+      localPipe = null;
+      throw error;
+    });
+  }
+  return localPipe;
+}
+
+export function warmLocalAsr() {
+  if (chosenProvider() === 'local') loadLocal().catch((e) => console.error('Local ASR load failed', e));
+}
+
+async function toFloat32(audio: Buffer, extension: string) {
+  const id = randomBytes(8).toString('hex');
+  const source = join(tmpdir(), `tilawah-${id}${extension.startsWith('.') ? extension : `.${extension}`}`);
+  const target = join(tmpdir(), `tilawah-${id}.f32`);
+  await writeFile(source, audio);
+  const code = await new Promise<number>((resolve) => {
+    const child = spawn('ffmpeg', ['-y', '-i', source, '-ar', '16000', '-ac', '1', '-f', 'f32le', target], { stdio: 'ignore' });
+    child.on('error', () => resolve(-1));
+    child.on('close', (status) => resolve(status ?? -1));
+  });
+  await unlink(source).catch(() => {});
+  if (code !== 0) {
+    await unlink(target).catch(() => {});
+    throw new Error('Could not read the recording audio.');
+  }
+  const raw = await readFile(target);
+  await unlink(target).catch(() => {});
+  return new Float32Array(raw.buffer, raw.byteOffset, Math.floor(raw.byteLength / 4)).slice();
+}
+
+async function local(audio: Buffer, extension: string) {
+  const pipe = await loadLocal();
+  const samples = await toFloat32(audio, extension);
+  const out = await pipe(samples, { chunk_length_s: 30, stride_length_s: 5 });
+  const text = Array.isArray(out) ? out.map((o: any) => o.text).join(' ') : out?.text;
+  if (!text) throw new Error('Local ASR returned an empty transcript.');
+  return String(text);
+}
+
 async function selfhost(audio: Buffer, mime: string) {
   const url = process.env.SELFHOST_ASR_URL || '';
   const form = new FormData();
@@ -137,6 +196,9 @@ export async function transcribe(audio: Buffer, filename: string) {
   const provider = chosenProvider();
   if (provider === 'none') throw new AsrNotConfiguredError();
   const extension = filename.includes('.') ? filename.slice(filename.lastIndexOf('.')) : '.m4a';
+  if (provider === 'local') {
+    return { text: (await local(audio, extension)).trim(), provider, model: LOCAL_MODEL };
+  }
   const wav = await toWav(audio, extension);
   const payload = wav ?? audio;
   const mime = wav ? 'audio/wav' : 'application/octet-stream';
